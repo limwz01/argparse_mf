@@ -110,6 +110,7 @@ namespace argparse {
     template<> inline unsigned short get(const std::string &v) { return std::stoul(v); }
     template<> inline unsigned long get(const std::string &v) { return std::stoul(v); }
 
+    class Args;
     template<typename T> inline T get(const std::string &v) { // remaining types
         if constexpr (is_vector<T>::value) {
             const std::vector<std::string> splitted = split(v);
@@ -139,6 +140,8 @@ namespace argparse {
 #else
             throw std::runtime_error("Enum not supported, please install magic_enum (https://github.com/Neargye/magic_enum)");
 #endif
+        } else if constexpr (std::is_base_of<Args, T>::value) {
+            throw std::runtime_error("not supposed to reach converting string to Args");
         } else {
             return T(v);
         }
@@ -147,6 +150,8 @@ namespace argparse {
     struct ConvertBase {
         virtual ~ConvertBase() = default;
         virtual void convert(const std::string &v) = 0;
+        virtual void parser_parse(const std::string &program_name, const std::vector<std::string> &params, const bool raise_on_error) = 0;
+        virtual void parser_help(const std::string &program_name) = 0;
         virtual void set_default(const std::unique_ptr<ConvertBase> &default_value, const std::string &default_string) = 0;
         [[nodiscard]] virtual size_t get_type_id() const = 0;
         [[nodiscard]] virtual std::string get_allowed_entries() const = 0;
@@ -159,14 +164,35 @@ namespace argparse {
         explicit ConvertType(const T &value) : ConvertBase(), data(value) {};
 
         void convert(const std::string &v) override {
-            data = get<T>(v);
+            if constexpr (std::is_base_of<Args, T>::value) {
+                throw std::runtime_error("not supposed to reach converting string to Args");
+            } else {
+                data = get<T>(v);
+            }
+        }
+
+        void parser_parse(const std::string &program_name, const std::vector<std::string> &params, const bool raise_on_error) override {
+            if constexpr (std::is_base_of<Args,T>::value) {
+                data.parse(program_name, params, raise_on_error);
+            }
+        }
+
+        void parser_help(const std::string &program_name) override {
+            if constexpr (std::is_base_of<Args,T>::value) {
+                data.set_program_name(program_name);
+                data.help();
+            }
         }
 
         void set_default(const std::unique_ptr<ConvertBase> &default_value, const std::string &default_string) override {
-            if (this->get_type_id() == default_value->get_type_id())    // When the types do not match exactly. resort to string conversion
-                data = ((ConvertType<T>*)(default_value.get()))->data;
-            else
-                data = get<T>(default_string);
+            if constexpr (std::is_base_of<Args, T>::value) {
+                throw std::runtime_error("not supposed to reach setting default for Args");
+            } else {
+                if (this->get_type_id() == default_value->get_type_id())    // When the types do not match exactly. resort to string conversion
+                    data = ((ConvertType<T>*)(default_value.get()))->data;
+                else
+                    data = get<T>(default_string);
+            }
         }
 
         [[nodiscard]] size_t get_type_id() const override {
@@ -189,7 +215,7 @@ namespace argparse {
     };
 
     struct Entry {
-        enum ARG_TYPE {ARG, KWARG, FLAG} type;
+        enum ARG_TYPE {ARG, KWARG, FLAG, SUBPARSER} type;
 
         Entry(ARG_TYPE type, const std::string& key, std::string help, std::optional<std::string> implicit_value=std::nullopt) :
                 type(type),
@@ -243,10 +269,13 @@ namespace argparse {
         std::unique_ptr<ConvertBase> datap;
         std::unique_ptr<ConvertBase> data_default;
         bool _is_multi_argument = false;
-        bool is_set_by_user = true;
+        bool is_set_by_user = false;
 
         [[nodiscard]] std::string _get_keys() const {
             std::stringstream ss;
+            if (type == SUBPARSER) {
+                return "{" + keys_[0] + "}";
+            }
             for (size_t i = 0; i < keys_.size(); i++)
                 ss << (i? "," : "") << (type == ARG? "" : (keys_[i].size() > 1 ? "--" : "-")) + keys_[i];
             return ss.str();
@@ -264,7 +293,6 @@ namespace argparse {
         }
 
         void _apply_default() {
-            is_set_by_user = false;
             if (data_default != nullptr) {
                 value_ = *default_str_; // for printing
                 datap->set_default(data_default, *default_str_);
@@ -289,6 +317,7 @@ namespace argparse {
     class Args {
     private:
         size_t _arg_idx = 0;
+        bool is_parsed = false;
         std::string program_name;
         std::vector<std::string> params;
         std::vector<std::shared_ptr<Entry>> all_entries;
@@ -336,12 +365,38 @@ namespace argparse {
             return kwarg(key, help, "true").set_default<bool>(false);
         }
 
+        /* Add a subparser
+         * key : A command string
+         * help : Description of the variable
+         *
+         * Returns a reference to the Entry, which will collapse into the requested Args type in `Entry::operator T()`
+         */
+        Entry &subparser(const std::string &key, const std::string &help) {
+            std::shared_ptr<Entry> entry = std::make_shared<Entry>(Entry::SUBPARSER, key, help);
+            arg_entries.emplace_back(entry);
+            all_entries.emplace_back(entry);
+            return *entry;
+        }
+
+        void set_program_name(const std::string &program_name){
+            this->program_name = program_name;
+        }
+
+        bool get_is_parsed(){
+            return is_parsed;
+        }
+
         virtual void welcome() {}       // Allow to overwrite the `welcome` function to add a welcome-message to the help output
         virtual void help() {
             welcome();
-            cout << "Usage: " << program_name << " ";
-            for (const auto &entry : arg_entries)
-                cout << entry->keys_[0] << ' ';
+            cout << "Usage: " << program_name;
+            auto sep = " ";
+            for (const auto &entry : arg_entries) {
+                cout << sep << entry->_get_keys();
+                if (entry->type == Entry::SUBPARSER) {
+                    sep = " / ";
+                }
+            }
             cout << " [options...]" << endl;
             for (const auto &entry : arg_entries) {
                 cout << setw(17) << entry->keys_[0] << " : " << entry->help << entry->info() << endl;
@@ -349,10 +404,18 @@ namespace argparse {
 
             cout << endl << "Options:" << endl;
             for (const auto &entry : all_entries) {
-                if (entry->type != Entry::ARG) {
+                if (entry->type != Entry::ARG && entry->type != Entry::SUBPARSER) {
                     cout << setw(17) << entry->_get_keys() << " : " << entry->help << entry->info() << endl;
                 }
             }
+
+            for (const auto &entry : all_entries) {
+                if (entry->type == Entry::SUBPARSER) {
+                    cout << endl << "Subparser " << entry->_get_keys() << ":" << endl;
+                    entry->datap->parser_help(program_name + " " + entry->keys_[0]);
+                }
+            }
+
         }
 
         void validate(const bool &raise_on_error) {
@@ -368,13 +431,19 @@ namespace argparse {
             }
         }
 
+        void parse(int argc, const char* const *argv, const bool &raise_on_error) {
+            return parse(argv[0], std::vector<std::string>(argv + 1, argv + argc), raise_on_error);
+        }
+        void parse(const std::string &program_name, const std::vector<std::string> &params, const bool &raise_on_error) {
+            this->program_name = program_name;
+            this->params = params;
+            return parse(raise_on_error);
+        }
         /* parse all parameters and also check for the help_flag which was set in this constructor
          * Upon error, it will print the error and exit immediately.
          */
-        void parse(int argc, const char* const *argv, const bool &raise_on_error) {
-            program_name = argv[0];
-            params = std::vector<std::string>(argv + 1, argv + argc);
-
+        void parse(const bool &raise_on_error) {
+            is_parsed = true;
             bool& _help = flag("help", "print help");
 
             auto is_value = [&](const size_t &i) -> bool {
@@ -420,7 +489,9 @@ namespace argparse {
                 }
             };
 
-            std::vector<std::string> arguments_flat;
+            size_t arg_i = 0;
+            size_t arg_multi_i = arg_entries.size();
+            std::vector<std::string> arguments_remaining;
             for (size_t i = 0; i < params.size(); i++) {
                 if (!is_value(i)) {
                     if (params[i].size() > 1 && params[i][1] == '-') {  // long --
@@ -434,36 +505,64 @@ namespace argparse {
                         add_param(i, j_end);
                     }
                 } else {
-                    arguments_flat.emplace_back(params[i]);
+                    if (arg_i < arg_entries.size()) {
+                        auto entry = arg_entries[arg_i];
+                        if (entry->type == Entry::SUBPARSER) {
+                            if (params[i]==entry->keys_[0]){
+                                entry->is_set_by_user = true;
+                                arg_entries[arg_i]->datap->parser_parse(program_name + " " + params[i], std::vector(params.begin() + i + 1, params.end()), raise_on_error);
+                                break;
+                            } else {
+                                arg_i++;
+                                // do not consume the params if it does not match the subparser
+                                i--;
+                            }
+                        }
+                        else if (arg_entries[arg_i]->_is_multi_argument) {
+                            arguments_remaining.emplace_back(params[i]);
+                            arg_multi_i = arg_i;
+                            arg_i = arg_entries.size();
+                        } else {
+                            arg_entries[arg_i]->_convert(params[i]);
+                            arg_i++;
+                        }
+                    } else {
+                        arguments_remaining.emplace_back(params[i]);
+                    }
                 }
             }
 
-            // Parse all the positional arguments, making sure multi_argument positional arguments are processed last to enable arguments afterwards
-            size_t arg_i = 0;
-            for (; arg_i < arg_entries.size() && !arg_entries[arg_i]->_is_multi_argument; arg_i++) { // iterate over positional arguments until a multi-argument is found
-                if (arg_i < arguments_flat.size())
-                    arg_entries[arg_i]->_convert(arguments_flat[arg_i]);
-            }
-            size_t arg_j = 1;
-            for (size_t j_end = arg_entries.size() - arg_i; arg_j <= j_end; arg_j++) { // iterate from back to front, to ensure non-multi-arguments in the front and back are given preference
-                size_t flat_idx = arguments_flat.size() - arg_j;
-                if (flat_idx < arguments_flat.size() && flat_idx >= arg_i) {
-                    if (arg_entries[arg_entries.size() - arg_j]->_is_multi_argument) {
-                        std::stringstream s;  // Combine multiple arguments into 1 comma-separated string for parsing
-                        copy(&arguments_flat[arg_i],&arguments_flat[flat_idx + 1], std::ostream_iterator<std::string>(s,","));
-                        std::string value = s.str();
-                        value.back() = '\0'; // remove trailing ','
-                        arg_entries[arg_i]->_convert(value);
-                    } else {
-                        arg_entries[arg_entries.size() - arg_j]->_convert(arguments_flat[flat_idx]);
+            // all remaining arguments go into any found multi-argument value
+            if (arg_multi_i < arg_entries.size()) {
+                for (size_t i = arg_entries.size() - 1; i > arg_multi_i; i--) { // would not underflow because condition implies i > 0
+                    auto entry = arg_entries[i];
+                    if (entry->type == Entry::SUBPARSER) {
+                        entry->error = "Subparser " + entry->keys_[0] + " not allowed after multi-argument "+arg_entries[arg_multi_i]->keys_[0];
+                    } else if (arg_entries[arg_i]->_is_multi_argument) {
+                        entry->error = "Multi-argument " + entry->keys_[0] + " not allowed after multi-argument "+arg_entries[arg_multi_i]->keys_[0];
+                    } else if (arguments_remaining.size()>0){
+                        auto &val = arguments_remaining.back();
+                        arguments_remaining.pop_back();
+                        arg_entries[arg_i]->_convert(val);
                     }
+                }
+                if (arguments_remaining.size() > 0) {
+                    std::stringstream s; // Combine multiple arguments into 1 comma-separated string for parsing
+                    std::copy(arguments_remaining.begin(), arguments_remaining.end(), std::ostream_iterator<std::string>(s, ","));
+                    std::string value = s.str();
+                    value.pop_back(); // remove trailing ','
+                    arg_entries[arg_multi_i]->_convert(value);
                 }
             }
 
             // try to apply default values for arguments which have not been set
             for (const auto &entry : all_entries) {
-                if (!entry->value_.has_value()) {
-                    entry->_apply_default();
+                if (entry->type != Entry::SUBPARSER) {
+                    if (!entry->value_.has_value()) {
+                        entry->_apply_default();
+                    } else {
+                        entry->is_set_by_user = true;
+                    }
                 }
             }
 
@@ -478,7 +577,7 @@ namespace argparse {
         void print() const {
             for (const auto &entry : all_entries) {
                 std::string snip = entry->type == Entry::ARG ? "(" + (entry->help.size() > 10 ? entry->help.substr(0, 7) + "..." : entry->help) + ")" : "";
-                cout << setw(21) << entry->_get_keys() + snip << " : " << (entry->is_set_by_user? bold(entry->value_.value_or("null")) : entry->value_.value_or("null")) << endl;
+                cout << setw(21) << entry->_get_keys() + snip << " : " << (entry->is_set_by_user ? (entry->type==Entry::SUBPARSER ? bold("parsed") : bold(entry->value_.value_or("null"))) : entry->value_.value_or("null")) << endl;
             }
         }
     };
